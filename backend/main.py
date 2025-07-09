@@ -2,6 +2,7 @@ import time
 import sounddevice as sd
 from fastapi import FastAPI
 import threading
+from contextlib import asynccontextmanager
 
 app = FastAPI()
 
@@ -41,9 +42,14 @@ def stream_audio():
     except Exception as e:
         print("Error accessing microphone:", e)
 
-@app.on_event("startup")
-def startup_event():
-    threading.Thread(target=check_microphone, daemon=True).start()
+@asynccontextmanager
+def lifespan(app: FastAPI):
+    thread = threading.Thread(target=check_microphone, daemon=True)
+    thread.start()
+    yield
+    # No explicit cleanup needed for daemon thread
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 def read_root():
