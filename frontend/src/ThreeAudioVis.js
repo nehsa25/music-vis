@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import { Canvas } from '@react-three/fiber';
 
 function Bars({ data }) {
   // Simple bar visualization
@@ -33,12 +33,38 @@ function ThreeAudioVis({ url }) {
     const ws = new window.WebSocket(url);
     ws.binaryType = 'arraybuffer';
     ws.onmessage = (event) => {
-      // Assume Float32Array PCM data, downsample for bars
-      const arr = new Float32Array(event.data);
+      // Robust decoding for Float32Array
+      let arr;
+      if (event.data instanceof ArrayBuffer) {
+        arr = new Float32Array(event.data);
+      } else if (event.data instanceof Blob) {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const buffer = reader.result;
+          const arr = new Float32Array(buffer);
+          console.log("ThreeAudioVis received (Blob):", arr.slice(0, 10));
+          updateBars(arr);
+        };
+        reader.readAsArrayBuffer(event.data);
+        return;
+      } else {
+        console.warn("Unknown WebSocket data type", event.data);
+        return;
+      }
+      console.log("ThreeAudioVis received:", arr.slice(0, 10));
+      updateBars(arr);
+    };
+    ws.onclose = (e) => {
+      console.log("Three WebSocket closed", e);
+    };
+    ws.onerror = (e) => {
+      console.log("Three WebSocket error", e);
+    };
+    function updateBars(arr) {
       const step = Math.floor(arr.length / 32);
       const bars = Array.from({ length: 32 }, (_, i) => arr[i * step] || 0);
       setData(bars);
-    };
+    }
     wsRef.current = ws;
     return () => ws.close();
   }, [url]);
