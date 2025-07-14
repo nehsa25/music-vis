@@ -1,385 +1,218 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import * as PIXI from 'pixi.js';
+import ClientInfo from './ClientInfo';
 
 const API_BASE = process.env.REACT_APP_API_BASE || 'http://localhost:8000';
 
 function PixiAudioVis({ url }) {
   const containerRef = useRef(null);
   const appRef = useRef();
-  const graphicsRef = useRef();
-  const [amplitude, setAmplitude] = useState(1);
-  const [saved, setSaved] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [visStyle, setVisStyle] = useState('waveform');
-  const [waveformSpeed, setWaveformSpeed] = useState(0.002);
-  const wsWaveformsRef = useRef(null);
-  const [testComplete, setTestComplete] = useState(false);
+  const [visMode, setVisMode] = useState('raw');
+  const [volume, setVolume] = useState(1);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [rawRows, setRawRows] = useState([]); // Store previous rows for raw mode
+  const [paused, setPaused] = useState(false);
+  const scrollRef = useRef();
+  const MAX_ROWS = 300;
 
-  // --- Event counters (refs, never recreated) ---
-  const eventsFiredRef = useRef(0);
-  const eventsEchoedRef = useRef(0);
-  const eventsReceivedRef = useRef(0);
-
-  // Fetch shared waveforms on mount
+  // WebSocket for volume
   useEffect(() => {
-    fetch(API_BASE + '/waveforms')
-      .then(r => r.json())
-      .then(setSaved);
-    const ws = new window.WebSocket(API_BASE.replace('http', 'ws') + '/waveforms/ws');
+    const ws = new window.WebSocket(url);
     ws.onmessage = (event) => {
       try {
+        // Always use only the latest event, discard any backlog
         const msg = JSON.parse(event.data);
-        if (msg.type === 'update' && Array.isArray(msg.waveforms)) {
-          setSaved(msg.waveforms);
+        if (typeof msg.volume === 'number') {
+          const vol = Math.max(1, Math.min(500, Math.round(msg.volume)));
+          setVolume(vol);
+          setRawRows(prev => {
+            if (paused) return prev; // Do not update if paused
+            const dashCount = Math.max(1, Math.min(200, Math.round(vol / 2.5)));
+            const newRows = [...prev, { dashes: '-'.repeat(dashCount), vol }];
+            // Limit to MAX_ROWS for memory
+            if (newRows.length > MAX_ROWS) newRows.shift();
+            return newRows;
+          });
         }
-      } catch (e) { console.error('Waveform WS error', e); }
+      } catch (e) {}
     };
-    wsWaveformsRef.current = ws;
-    return () => { ws.close(); };
-  }, []);
+    ws.onopen = () => {
+      // Clear any old rows on reconnect to always show live state
+      setRawRows([]);
+    };
+    ws.onerror = () => {
+      // Optionally handle error
+    };
+    return () => ws.close();
+  }, [url, paused]);
 
-  // Load waveform from saved
-  const loadSavedWave = useCallback((index) => {
-    setSelected(index);
-  }, []);
-
-  // --- Main Pixi.js and event logic ---
+  // Scroll to end when unpaused
   useEffect(() => {
-    let destroyed = false;
-    let ws;
-    let tickerFn = null;
-    const containerNode = containerRef.current;
-    if (!containerNode) return;
+    if (!paused && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [paused, rawRows]);
 
-    // --- Visualization history buffer ---
-    const HISTORY_SIZE = 20;
-    let history = [];
-    let bufferLen = 0;
-    let scrollOffset = 0;
-    let lastEntryTime = null;
-    let lastExitTime = null;
-    let receivedEventQueue = [];
-    let echoing = false;
-    let shutdownPosted = false;
-
-    // --- Pixi.js setup ---
-    const app = new PIXI.Application();
-    app.init({ width: 600, height: 300, background: '#222' }).then(() => {
-      if (destroyed) {
-        app.destroy(true, { children: true });
+  // Pixi.js simple visualization
+  useEffect(() => {
+    let cancelled = false;
+    async function setupPixi() {
+      if (visMode !== 'pixi') {
+        if (appRef.current) {
+          appRef.current.destroy(true, { children: true });
+          appRef.current = null;
+        }
         return;
       }
-      appRef.current = app;
-      if (app.canvas && containerNode) {
-        containerNode.appendChild(app.canvas);
-      }
-      // Animated background
-      const bg = new PIXI.Graphics();
-      app.stage.addChild(bg);
-      let bgHue = 0;
-      function hsvToRgb(h, s, v) {
-        h = h % 360;
-        let c = v * s;
-        let x = c * (1 - Math.abs(((h / 60) % 2) - 1));
-        let m = v - c;
-        let r = 0, g = 0, b = 0;
-        if (h < 60) [r, g, b] = [c, x, 0];
-        else if (h < 120) [r, g, b] = [x, c, 0];
-        else if (h < 180) [r, g, b] = [0, c, x];
-        else if (h < 240) [r, g, b] = [0, x, c];
-        else if (h < 300) [r, g, b] = [x, 0, c];
-        else [r, g, b] = [c, 0, x];
-        return ((Math.round((r + m) * 255) << 16) |
-                (Math.round((g + m) * 255) << 8) |
-                (Math.round((b + m) * 255)));
-      }
-      function drawBackground() {
-        bg.clear();
-        for (let i = 0; i < app.canvas.height; i += 4) {
-          const hue = (bgHue + i / 8) % 360;
-          const sat = 0.7;
-          const val = 0.25 + 0.25 * Math.sin(Date.now() / 1000 + i);
-          const color = hsvToRgb(hue, sat, val);
-          bg.fill({ color });
-          bg.rect(0, i, app.canvas.width, 4);
-          bg.fill();
+      let app = appRef.current;
+      if (!app) {
+        app = await PIXI.Application.create({
+          width: 600,
+          height: 200,
+          background: '#222',
+          antialias: true,
+          resolution: window.devicePixelRatio || 1,
+        });
+        if (cancelled) {
+          app.destroy(true, { children: true });
+          return;
         }
-        bgHue = (bgHue + 0.2) % 360;
+        appRef.current = app;
+        if (containerRef.current) {
+          containerRef.current.innerHTML = '';
+          containerRef.current.appendChild(app.view);
+        }
       }
-      tickerFn = drawBackground;
-      app.ticker.add(drawBackground);
-
-      // --- Main waveform visualization ---
-      const graphics = new PIXI.Graphics();
+      let graphics = new PIXI.Graphics();
+      app.stage.removeChildren();
       app.stage.addChild(graphics);
-      graphicsRef.current = graphics;
       function draw() {
         graphics.clear();
-        graphics.beginPath();
-        graphics.setStrokeStyle({ width: 1, color: 0xff0000 });
-        graphics.moveTo(0, app.canvas.height / 2);
-        graphics.lineTo(app.canvas.width, app.canvas.height / 2);
-        graphics.stroke();
-        graphics.beginPath();
-        graphics.setStrokeStyle({ width: 2, color: 0x61dafb });
-        const w = app.canvas.width;
-        const h = app.canvas.height;
-        const total = bufferLen * HISTORY_SIZE;
-        if (history.length > 0) {
-          const pxPerSample = w / total;
-          let x0 = -scrollOffset;
-          for (let i = 0; i < total; i++) {
-            const histIdx = Math.floor(i / bufferLen);
-            const bufIdx = i % bufferLen;
-            if (histIdx >= history.length) break;
-            const x = x0 + i * pxPerSample;
-            const y = h / 2 + history[histIdx][bufIdx] * h * 0.45 * amplitude;
-            if (i === 0) graphics.moveTo(x, y);
-            else graphics.lineTo(x, y);
-          }
-          graphics.stroke();
-        }
+        // Draw a bar whose width is proportional to volume
+        const w = app.screen.width;
+        const h = app.screen.height;
+        const barW = (volume / 500) * (w - 40);
+        graphics.beginFill(0x61dafb);
+        graphics.drawRoundedRect(20, h / 2 - 20, barW, 40, 20);
+        graphics.endFill();
+        // Draw the volume number
+        const style = new PIXI.TextStyle({ fill: '#fff', fontSize: 28, fontWeight: 'bold' });
+        const text = new PIXI.Text(volume.toString(), style);
+        text.x = w / 2 - text.width / 2;
+        text.y = h / 2 - text.height / 2;
+        app.stage.addChild(text);
       }
       app.ticker.add(draw);
+      return () => {
+        app.ticker.remove(draw);
+        app.stage.removeChildren();
+        graphics.destroy();
+      };
+    }
+    setupPixi();
+    return () => { cancelled = true; };
+  }, [visMode, volume]);
 
-      // --- WebSocket for audio events ---
-      ws = new window.WebSocket(url);
-      ws.binaryType = 'arraybuffer';
-      ws.onopen = () => {};
-      ws.onerror = (e) => {
-        console.error('[PixiAudioVis] WebSocket error:', e);
-      };
-      ws.onclose = (e) => {
-        if (e.code !== 1000) {
-          console.error('[PixiAudioVis] WebSocket closed:', e);
-        } else {
-          console.log('[PixiAudioVis] WebSocket closed cleanly by server.');
-        }
-        // After close, keep echoing any remaining buffered events
-        function sendShutdownPost() {
-          if (window.__pixi_shutdown_posted) {
-            console.warn('[SHUTDOWN POST] Attempted duplicate POST', {
-              eventsFired: eventsFiredRef.current,
-              eventsReceived: eventsReceivedRef.current,
-              eventsEchoed: eventsEchoedRef.current,
-              stack: new Error().stack
-            });
-            return;
-          }
-          window.__pixi_shutdown_posted = true;
-          console.log('[SHUTDOWN POST]', {
-            eventsFired: eventsFiredRef.current,
-            eventsReceived: eventsReceivedRef.current,
-            eventsEchoed: eventsEchoedRef.current,
-            stack: new Error().stack
-          });
-          fetch(API_BASE + '/shutdown', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              eventsFired: eventsFiredRef.current,
-              eventsReceived: eventsReceivedRef.current,
-              eventsEchoed: eventsEchoedRef.current
-            })
-          });
-          if (appRef.current && appRef.current.ticker) appRef.current.ticker.stop();
-        }
-        function finishEchoing() {
-          if (receivedEventQueue.length > 0) {
-            tryEchoNext();
-            setTimeout(finishEchoing, 10);
-          } else if (
-            eventsEchoedRef.current === eventsFiredRef.current &&
-            eventsEchoedRef.current > 0 &&
-            !window.__pixi_shutdown_posted
-          ) {
-            setTestComplete(true);
-            sendShutdownPost();
-          } else if (
-            eventsFiredRef.current > 0 &&
-            (eventsEchoedRef.current !== eventsFiredRef.current || receivedEventQueue.length > 0)
-          ) {
-            setTimeout(finishEchoing, 10);
-          }
-        }
-        finishEchoing();
-      };
-      function tryEchoNext() {
-        if (echoing || receivedEventQueue.length === 0) return;
-        echoing = true;
-        const { duration } = receivedEventQueue.shift();
-        fetch(API_BASE + '/waveform_cross_time', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(duration ? { duration } : {})
-        }).then(r => {
-          if (r.ok) {
-            eventsEchoedRef.current += 1;
-            echoing = false;
-            if (receivedEventQueue.length > 0) {
-              tryEchoNext();
-            } else if (
-              eventsEchoedRef.current === eventsFiredRef.current &&
-              eventsEchoedRef.current > 0 &&
-              !shutdownPosted
-            ) {
-              shutdownPosted = true;
-              setTestComplete(true);
-              console.log('[SHUTDOWN POST]', {
-                eventsFired: eventsFiredRef.current,
-                eventsReceived: eventsReceivedRef.current,
-                eventsEchoed: eventsEchoedRef.current
-              });
-              fetch(API_BASE + '/shutdown', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  eventsFired: eventsFiredRef.current,
-                  eventsReceived: eventsReceivedRef.current,
-                  eventsEchoed: eventsEchoedRef.current
-                })
-              });
-              if (appRef.current && appRef.current.ticker) appRef.current.ticker.stop();
-            }
-          } else {
-            echoing = false;
-          }
-        });
-      }
-      ws.onmessage = (event) => {
-        try {
-          let arr;
-          if (event.data instanceof ArrayBuffer) {
-            arr = new Float32Array(event.data);
-            eventsFiredRef.current += 1;
-            eventsReceivedRef.current += 1;
-            // Diagnostic log for event counters
-            console.log('[EVENT COUNTERS]', {
-              eventsFired: eventsFiredRef.current,
-              eventsReceived: eventsReceivedRef.current,
-              eventsEchoed: eventsEchoedRef.current
-            });
-            if (selected !== null && saved[selected]) {
-              arr = new Float32Array(saved[selected].data);
-            }
-            if (history.length === 0) bufferLen = arr.length;
-            if (arr.length === bufferLen) {
-              history.push(Array.from(arr));
-              if (history.length > HISTORY_SIZE) history.shift();
-              const w = app.canvas.width;
-              const total = bufferLen * HISTORY_SIZE;
-              const pxPerSample = w / total;
-              if (scrollOffset === 0) {
-                lastEntryTime = Date.now();
-              }
-              const minCrossTime = 1.2;
-              const frameRate = 50;
-              const minSpeed = 0.002;
-              const speedFactor = waveformSpeed / minSpeed;
-              const increment = w / (minCrossTime * frameRate) * speedFactor;
-              scrollOffset += increment;
-              if (scrollOffset > pxPerSample * bufferLen) {
-                scrollOffset = 0;
-                lastExitTime = Date.now();
-              }
-            }
-            const duration = lastEntryTime && lastExitTime ? (lastExitTime - lastEntryTime) / 1000 : undefined;
-            receivedEventQueue.push({ duration });
-            tryEchoNext();
-            return;
-          }
-          if (event.data instanceof Blob) {
-            const reader = new FileReader();
-            reader.onload = () => {
-              let arr = new Float32Array(reader.result);
-              if (selected !== null && saved[selected]) {
-                arr = new Float32Array(saved[selected].data);
-              }
-              if (history.length === 0) bufferLen = arr.length;
-              if (arr.length === bufferLen) {
-                history.push(Array.from(arr));
-                if (history.length > HISTORY_SIZE) history.shift();
-                const w = app.canvas.width;
-                const total = bufferLen * HISTORY_SIZE;
-                const pxPerSample = w / total;
-                scrollOffset += pxPerSample * bufferLen * waveformSpeed;
-                if (scrollOffset > pxPerSample * bufferLen) {
-                  scrollOffset = 0;
-                }
-              }
-            };
-            reader.readAsArrayBuffer(event.data);
-            return;
-          }
-        } catch (err) {
-          console.error('[PixiAudioVis] WebSocket message error:', err);
-        }
-      };
-    });
-    return () => {
-      destroyed = true;
-      if (ws) ws.close();
-      const app = appRef.current;
-      if (app && app.ticker && tickerFn) {
-        try {
-          app.ticker.remove(tickerFn);
-        } catch (e) {}
-      }
-      if (app && app.stage) {
-        app.stage.removeChildren().forEach(child => {
-          if (child.destroy) child.destroy({ children: true });
-        });
-      }
-      if (app && app.canvas && containerNode && containerNode.contains(app.canvas)) {
-        containerNode.removeChild(app.canvas);
-      }
-      if (app) app.destroy(true, { children: true });
-    };
-  }, [url, amplitude, selected, visStyle, waveformSpeed, saved]);
-
-  // --- Controls panel ---
-  const handleAmplitudeChange = (e) => {
-    setAmplitude(Math.max(0, e.target.value));
+  // Fullscreen logic
+  const handleFullscreen = () => {
+    // Use the root div for fullscreen, not just the Pixi container
+    const elem = document.documentElement;
+    if (!isFullscreen) {
+      if (elem.requestFullscreen) elem.requestFullscreen();
+      else if (elem.webkitRequestFullscreen) elem.webkitRequestFullscreen();
+      else if (elem.mozRequestFullScreen) elem.mozRequestFullScreen();
+      else if (elem.msRequestFullscreen) elem.msRequestFullscreen();
+      setIsFullscreen(true);
+    } else {
+      if (document.exitFullscreen) document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+      else if (document.mozCancelFullScreen) document.mozCancelFullScreen();
+      else if (document.msExitFullscreen) document.msExitFullscreen();
+      setIsFullscreen(false);
+    }
   };
+  useEffect(() => {
+    function onFullscreenChange() {
+      setIsFullscreen(!!document.fullscreenElement);
+    }
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
+
+  // Visualization rendering
+  let visContent = null;
+  if (visMode === 'raw') {
+    visContent = (
+      <div
+        ref={scrollRef}
+        style={{
+          fontSize: 18,
+          color: '#61dafb',
+          margin: 0,
+          userSelect: 'none',
+          width: '100%',
+          height: '100%',
+          overflowY: 'auto',
+          background: 'transparent',
+          padding: 0,
+          whiteSpace: 'pre',
+          fontFamily: 'monospace',
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'flex-end',
+          alignItems: 'flex-start',
+          textAlign: 'left',
+        }}
+      >
+        {rawRows.map((row, i) => (
+          row.vol > 0 ? <div key={i}>{row.dashes} {row.vol}</div> : null
+        ))}
+      </div>
+    );
+  } else if (visMode === 'pixi') {
+    visContent = <div style={{ width: 600, height: 200 }} ref={containerRef} />;
+  } else if (visMode === 'three') {
+    visContent = (
+      <div style={{ color: '#fff', fontSize: 24, textAlign: 'center', marginTop: 40 }}>
+        [three-react-fiber visualization placeholder]<br />Volume: {volume}
+      </div>
+    );
+  }
 
   return (
-    <div>
-      <div ref={containerRef} style={{ width: '100%', height: '300px', position: 'relative' }} />
-      {testComplete && (
-        <div style={{ color: 'lime', fontWeight: 'bold', textAlign: 'center', marginTop: 10 }}>
-          Test complete. Final counts sent to server.
-        </div>
-      )}
-      <div style={{ display: 'flex', justifyContent: 'center', marginTop: '10px' }}>
-        <button onClick={() => { if (graphicsRef.current) graphicsRef.current.clear(); }}>
-          Clear
-        </button>
-        <button onClick={() => { if (graphicsRef.current) graphicsRef.current.visible = !graphicsRef.current.visible; }}>
-          Toggle Waveform
-        </button>
-        <select value={visStyle} onChange={e => setVisStyle(e.target.value)} style={{ marginLeft: 8 }}>
-          <option value="waveform">Waveform</option>
-          <option value="particles">Particle Swarm</option>
-          <option value="lava">Fluid - Lava</option>
-          <option value="water">Fluid - Water</option>
+    <div
+      style={{
+        width: '100vw',
+        height: '100vh',
+        position: 'fixed',
+        top: 0,
+        left: 0,
+        background: '#222',
+        zIndex: isFullscreen ? 1000 : 'auto',
+        overflow: 'hidden',
+        transition: 'all 0.2s',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <div style={{ position: 'absolute', top: 10, left: 10, zIndex: 10, display: isFullscreen ? 'none' : 'block' }}>
+        <select value={visMode} onChange={e => setVisMode(e.target.value)} style={{ fontSize: 18, marginRight: 12 }}>
+          <option value="raw">Raw</option>
+          <option value="pixi">Pixi.js</option>
+          <option value="three">three-react-fiber</option>
         </select>
-        <label style={{ marginLeft: 8 }}>Amplitude
-          <input type="range" min="0.1" max="2" step="0.01" value={amplitude} onChange={handleAmplitudeChange} />
-        </label>
-        <label style={{ marginLeft: 8 }}>Waveform Speed
-          <input type="range" min="0.002" max="0.02" step="0.0001" value={waveformSpeed} onChange={e => setWaveformSpeed(Number(e.target.value))} />
-        </label>
-        <button onClick={() => window.savePixiWave()}>Save</button>
-        <select value={selected ?? ''} onChange={e => loadSavedWave(e.target.value === '' ? null : Number(e.target.value))}>
-          <option value=''>Live</option>
-          {saved.map((item, i) => (
-            <option key={i} value={i}>{item.name}</option>
-          ))}
-        </select>
-        <button onClick={() => {
-          const el = appRef.current?.canvas;
-          if (el && el.requestFullscreen) el.requestFullscreen();
-        }}>Fullscreen</button>
+        <button onClick={handleFullscreen} style={{ fontSize: 18, marginRight: 12 }}>
+          {isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}
+        </button>
+        <button onClick={() => setPaused(p => !p)} style={{ fontSize: 18 }}>
+          {paused ? 'Resume' : 'Pause'}
+        </button>
+        <ClientInfo />
+      </div>
+      <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        {visContent}
       </div>
     </div>
   );
