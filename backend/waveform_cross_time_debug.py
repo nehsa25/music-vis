@@ -105,13 +105,13 @@ async def audio_broadcast_loop():
     MAX_CPU = 20.0  # percent
     MAX_MEM_MB = 200.0  # MB
     # --- Moving average and threshold config ---
-    SMOOTHING_WINDOW = 4  # Number of samples for moving average (1s window at 0.25s/sample)
+    SMOOTHING_WINDOW = 2  # Reduce window for lower latency
     THRESHOLD_ABOVE_BASELINE = 0.02  # Minimum RMS above baseline to consider as real sound
     rms_history = []
     try:
         while not stop_audio_flag.is_set():
             try:
-                arr = audio_queue.get(timeout=1)
+                arr = audio_queue.get(timeout=0.2)  # Lower timeout for more frequent updates
             except queue.Empty:
                 arr = np.zeros((1024, 1), dtype=np.float32)
             arr = arr.flatten().astype(np.float32)
@@ -136,7 +136,7 @@ async def audio_broadcast_loop():
                     await ws.send_json({"volume": send_vol, "rms": rms})
                 except Exception:
                     audio_clients.discard(ws)
-            await asyncio.sleep(0.25)  # Send every 1/4 second
+            await asyncio.sleep(0.08)  # Lower interval for faster updates
     finally:
         stream.stop()
         stream.close()
