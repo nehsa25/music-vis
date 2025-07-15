@@ -22,7 +22,8 @@ with sd.InputStream(callback=callback, channels=CHANNELS, samplerate=SAMPLERATE,
     time.sleep(DURATION)
 
 if rms_values:
-    baseline = float(np.mean(rms_values))
+    # Use a higher percentile (e.g., 90th) to set a more aggressive baseline
+    baseline = float(np.percentile(rms_values, 90))
 else:
     baseline = 0.0
 

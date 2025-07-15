@@ -9,7 +9,7 @@ function App() {
   const [status, setStatus] = useState('Connecting to backend...');
 
   useEffect(() => {
-    fetch('http://127.0.0.1:8000/')
+    fetch('http://192.168.0.59:8000/')
       .then(res => res.json())
       .then(data => setStatus(data.status))
       .catch(() => setStatus('Could not connect to backend.'));
@@ -39,7 +39,7 @@ function App() {
             </Select>
           </FormControl>
         </Box>
-        {visType === 'pixi' ? <PixiAudioVis url="ws://localhost:8000/audio" /> : <ThreeAudioVis url="ws://localhost:8000/audio" />}
+        {visType === 'pixi' ? <PixiAudioVis url="ws://192.168.0.59:8000/audio" /> : <ThreeAudioVis url="ws://192.168.0.59:8000/audio" />}
       </header>
     </div>
   );

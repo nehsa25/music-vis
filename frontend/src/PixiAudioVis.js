@@ -2,24 +2,31 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as PIXI from 'pixi.js';
 import ClientInfo from './ClientInfo';
 
-const API_BASE = process.env.REACT_APP_API_BASE || 'http://localhost:8000';
+const API_BASE = 'http://192.168.0.59:8000';
+
+function isMobileDevice() {
+  return /Mobi|Android|iPhone|iPad|iPod|Opera Mini|IEMobile|WPDesktop/i.test(navigator.userAgent);
+}
 
 function PixiAudioVis({ url }) {
   const containerRef = useRef(null);
   const appRef = useRef();
-  const [visMode, setVisMode] = useState('raw');
+  // Default to 'raw' for all devices, but force 'raw' on mobile/tablet
+  const [visMode, setVisMode] = useState(isMobileDevice() ? 'raw' : 'raw');
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [rawRows, setRawRows] = useState([]); // Store previous rows for raw mode
   const [paused, setPaused] = useState(false);
   const scrollRef = useRef();
   const MAX_ROWS = 300;
+  const [wsError, setWsError] = useState(false);
 
   // WebSocket for volume
   useEffect(() => {
     const ws = new window.WebSocket(url);
     ws.onmessage = (event) => {
       try {
+        setWsError(false);
         // Always use only the latest event, discard any backlog
         const msg = JSON.parse(event.data);
         if (typeof msg.volume === 'number') {
@@ -37,11 +44,14 @@ function PixiAudioVis({ url }) {
       } catch (e) {}
     };
     ws.onopen = () => {
-      // Clear any old rows on reconnect to always show live state
       setRawRows([]);
+      setWsError(false);
     };
     ws.onerror = () => {
-      // Optionally handle error
+      setWsError(true);
+    };
+    ws.onclose = () => {
+      setWsError(true);
     };
     return () => ws.close();
   }, [url, paused]);
@@ -141,7 +151,14 @@ function PixiAudioVis({ url }) {
 
   // Visualization rendering
   let visContent = null;
-  if (visMode === 'raw') {
+  if (wsError) {
+    visContent = (
+      <div style={{ color: 'red', fontSize: 18, textAlign: 'center', width: '100%' }}>
+        Unable to connect to audio server.<br />
+        Please check your network or try again later.
+      </div>
+    );
+  } else if (visMode === 'raw') {
     visContent = (
       <div
         ref={scrollRef}
@@ -170,7 +187,7 @@ function PixiAudioVis({ url }) {
       </div>
     );
   } else if (visMode === 'pixi') {
-    visContent = <div style={{ width: 600, height: 200 }} ref={containerRef} />;
+    visContent = <div style={{ width: '100%', maxWidth: 600, height: 200 }} ref={containerRef} />;
   } else if (visMode === 'three') {
     visContent = (
       <div style={{ color: '#fff', fontSize: 24, textAlign: 'center', marginTop: 40 }}>
